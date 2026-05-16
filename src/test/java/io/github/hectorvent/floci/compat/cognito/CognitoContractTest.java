@@ -126,6 +126,32 @@ class CognitoContractTest {
     }
 
     @Test
+    void forgotPassword_unknownUser_returnsUserNotFoundException() throws Exception {
+        // Wirebit stg pool is PreventUserExistenceErrors=LEGACY → returns
+        // UserNotFoundException for unknown user. Fixture confirms this is the
+        // shape we replicate locally.
+        JsonNode fixture = FixtureLoader.load("forgot-password.unknown-user");
+        assertEquals("UserNotFoundException", fixture.path("error").path("name").asText());
+
+        Map<String, Object> req = Map.of(
+                "ClientId", clientId,
+                "Username", "ghost-" + System.nanoTime() + "@example.com"
+        );
+        var resp = given()
+                .header("X-Amz-Target", COGNITO_TARGET + "ForgotPassword")
+                .contentType("application/x-amz-json-1.1")
+                .body(MAPPER.writeValueAsString(req))
+            .when().post("/")
+            .then()
+                .statusCode(400)
+                .extract();
+
+        JsonNode body = MAPPER.readTree(resp.body().asString());
+        assertTrue(body.path("__type").asText("").contains("UserNotFoundException"),
+                "expected UserNotFoundException, got: " + body.path("__type").asText());
+    }
+
+    @Test
     void confirmSignUp_wrongCode_returnsCodeMismatchException() throws Exception {
         // First sign up a user so the username exists
         post("SignUp", Map.of(
