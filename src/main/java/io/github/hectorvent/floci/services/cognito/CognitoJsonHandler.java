@@ -69,6 +69,7 @@ public class CognitoJsonHandler {
             case "AdminRespondToAuthChallenge" -> handleAdminRespondToAuthChallenge(request);
             case "SignUp" -> handleSignUp(request);
             case "ConfirmSignUp" -> handleConfirmSignUp(request);
+            case "ResendConfirmationCode" -> handleResendConfirmationCode(request);
             case "ChangePassword" -> handleChangePassword(request);
             case "ForgotPassword" -> handleForgotPassword(request);
             case "ConfirmForgotPassword" -> handleConfirmForgotPassword(request);
@@ -457,6 +458,14 @@ public class CognitoJsonHandler {
                 request.path("ConfirmationCode").asText()
         );
         return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleResendConfirmationCode(JsonNode request) {
+        java.util.Map<String, Object> result = service.resendConfirmationCode(
+                request.path("ClientId").asText(),
+                request.path("Username").asText()
+        );
+        return Response.ok(objectMapper.valueToTree(result)).build();
     }
 
     private Response handleChangePassword(JsonNode request) {

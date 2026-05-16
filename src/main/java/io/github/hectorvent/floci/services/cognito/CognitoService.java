@@ -876,6 +876,72 @@ public class CognitoService {
         authFlowHandler.firePostConfirmation(pool, client, user, Map.of(), "PostConfirmation_ConfirmSignUp");
     }
 
+    /**
+     * Re-issue a verification code for an UNCONFIRMED user. Subject to the same
+     * 30s rate-limit as {@code SignUp}; AWS does NOT impose a separate cooldown,
+     * so back-to-back calls throw {@code LimitExceededException} from the
+     * underlying {@link VerificationCodeService}.
+     *
+     * <p>Returns the same {@code CodeDeliveryDetails} shape AWS does so Amplify
+     * SDK can read masked-destination feedback to the user.
+     */
+    public Map<String, Object> resendConfirmationCode(String clientId, String username) {
+        UserPoolClient client = clientStore.get(clientId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 404));
+        String userPoolId = client.getUserPoolId();
+        CognitoUser user = adminGetUser(userPoolId, username);
+
+        if (!"UNCONFIRMED".equals(user.getUserStatus())) {
+            throw new AwsException("InvalidParameterException",
+                    "User is already confirmed.", 400);
+        }
+
+        // Null only in legacy tests that pre-date the verification subsystem.
+        if (verificationCodes == null || messageDispatcher == null) {
+            return Map.of("CodeDeliveryDetails", Map.of(
+                    "AttributeName", "email",
+                    "DeliveryMedium", "EMAIL",
+                    "Destination", maskEmail(user.getAttributes().get("email"))));
+        }
+
+        // Only resolve the pool once we know we're going to dispatch — saves a
+        // storage lookup when status guard rejects.
+        UserPool pool = poolStore.get(userPoolId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool not found", 404));
+
+        String code;
+        try {
+            code = verificationCodes.issue(userPoolId, username,
+                    VerificationCode.Purpose.SIGNUP_CONFIRMATION,
+                    java.time.Duration.ofHours(24));
+        } catch (VerificationCodeException e) {
+            throw mapVerificationException(e);
+        }
+        messageDispatcher.dispatch(pool, user,
+                VerificationCode.Purpose.SIGNUP_CONFIRMATION, code, java.util.List.of());
+
+        String email = user.getAttributes().get("email");
+        return Map.of("CodeDeliveryDetails", Map.of(
+                "AttributeName", email != null ? "email" : "phone_number",
+                "DeliveryMedium", email != null ? "EMAIL" : "SMS",
+                "Destination", email != null ? maskEmail(email)
+                        : maskPhone(user.getAttributes().get("phone_number"))));
+    }
+
+    /** Mask an email to AWS-style {@code f***@e***} (aggressive masking per fixture observation). */
+    private static String maskEmail(String email) {
+        if (email == null || email.isEmpty()) return "****";
+        int at = email.indexOf('@');
+        if (at <= 0 || at == email.length() - 1) return "****";
+        return email.charAt(0) + "***@" + email.charAt(at + 1) + "***";
+    }
+
+    /** Mask a phone to show only the last 4 digits, e.g. {@code +***6789}. */
+    private static String maskPhone(String phone) {
+        if (phone == null || phone.length() < 4) return "****";
+        return "+***" + phone.substring(phone.length() - 4);
+    }
+
     /** Translate a VerificationCodeException into the corresponding AWS Cognito exception. */
     private AwsException mapVerificationException(VerificationCodeException e) {
         return switch (e.getKind()) {
