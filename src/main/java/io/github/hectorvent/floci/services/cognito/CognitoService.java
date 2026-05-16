@@ -1019,19 +1019,85 @@ public class CognitoService {
         userStore.put(userKey(poolId, user.getUsername()), user);
     }
 
-    public void forgotPassword(String clientId, String username) {
+    /**
+     * Initiate a password reset. Issues a 1h-TTL verification code and
+     * dispatches it via SES/SNS. Currently behaves as PreventUserExistenceErrors=LEGACY
+     * (matches wirebit-stg pool's observed behavior): unknown users throw
+     * {@code UserNotFoundException}. ENABLED mode (synthetic success) requires
+     * adding the field to {@link UserPoolClient} — future PR.
+     *
+     * <p>AWS rejects ForgotPassword for UNCONFIRMED users with
+     * {@code InvalidParameterException}; we mirror that.
+     */
+    public Map<String, Object> forgotPassword(String clientId, String username) {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 404));
-        // Verify user exists; real AWS would send email/SMS
-        adminGetUser(client.getUserPoolId(), username);
-        LOG.infov("ForgotPassword stub: user {0} requested password reset", username);
+        String userPoolId = client.getUserPoolId();
+        CognitoUser user = userStore.get(userKey(userPoolId, username))
+                .orElseThrow(() -> new AwsException("UserNotFoundException",
+                        "Username/client id combination not found.", 400));
+
+        if ("UNCONFIRMED".equals(user.getUserStatus())) {
+            throw new AwsException("InvalidParameterException",
+                    "Cannot reset password for the user as there is no registered/verified email or phone_number.",
+                    400);
+        }
+
+        // Null only in legacy tests that pre-date the verification subsystem.
+        if (verificationCodes == null || messageDispatcher == null) {
+            return Map.of("CodeDeliveryDetails", Map.of(
+                    "AttributeName", "email",
+                    "DeliveryMedium", "EMAIL",
+                    "Destination", maskEmail(user.getAttributes().get("email"))));
+        }
+
+        UserPool pool = poolStore.get(userPoolId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool not found", 404));
+
+        String code;
+        try {
+            code = verificationCodes.issue(userPoolId, username,
+                    VerificationCode.Purpose.PASSWORD_RESET,
+                    java.time.Duration.ofHours(1));
+        } catch (VerificationCodeException e) {
+            throw mapVerificationException(e);
+        }
+        messageDispatcher.dispatch(pool, user,
+                VerificationCode.Purpose.PASSWORD_RESET, code, java.util.List.of());
+
+        String email = user.getAttributes().get("email");
+        return Map.of("CodeDeliveryDetails", Map.of(
+                "AttributeName", email != null ? "email" : "phone_number",
+                "DeliveryMedium", email != null ? "EMAIL" : "SMS",
+                "Destination", email != null ? maskEmail(email)
+                        : maskPhone(user.getAttributes().get("phone_number"))));
     }
 
+    /**
+     * Complete a password reset by validating the code and setting the new
+     * password. Unknown user / wrong code / expired code all throw the
+     * AWS-faithful exception via {@link #mapVerificationException}.
+     */
     public void confirmForgotPassword(String clientId, String username, String confirmationCode, String newPassword) {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 404));
-        // Accept any confirmation code in the emulator
-        adminSetUserPassword(client.getUserPoolId(), username, newPassword, true);
+        String userPoolId = client.getUserPoolId();
+        if (userStore.get(userKey(userPoolId, username)).isEmpty()) {
+            throw new AwsException("UserNotFoundException",
+                    "Username/client id combination not found.", 400);
+        }
+
+        // Null only in legacy tests that pre-date the verification subsystem.
+        if (verificationCodes != null) {
+            try {
+                verificationCodes.consume(userPoolId, username,
+                        VerificationCode.Purpose.PASSWORD_RESET, confirmationCode);
+            } catch (VerificationCodeException e) {
+                throw mapVerificationException(e);
+            }
+        }
+
+        adminSetUserPassword(userPoolId, username, newPassword, true);
     }
 
     public Map<String, Object> getUser(String accessToken) {

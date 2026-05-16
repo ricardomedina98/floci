@@ -478,16 +478,11 @@ public class CognitoJsonHandler {
     }
 
     private Response handleForgotPassword(JsonNode request) {
-        service.forgotPassword(
+        java.util.Map<String, Object> result = service.forgotPassword(
                 request.path("ClientId").asText(),
                 request.path("Username").asText()
         );
-        ObjectNode response = objectMapper.createObjectNode();
-        ObjectNode delivery = response.putObject("CodeDeliveryDetails");
-        delivery.put("AttributeName", "email");
-        delivery.put("DeliveryMedium", "EMAIL");
-        delivery.put("Destination", "****");
-        return Response.ok(response).build();
+        return Response.ok(objectMapper.valueToTree(result)).build();
     }
 
     private Response handleConfirmForgotPassword(JsonNode request) {
