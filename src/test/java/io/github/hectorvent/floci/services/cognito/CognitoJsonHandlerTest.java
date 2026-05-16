@@ -38,7 +38,9 @@ class CognitoJsonHandlerTest {
                 new InMemoryStorage<>(),
                 "http://localhost:4566",
                 regionResolver,
-                null
+                null,
+                null,  // verificationCodes — null bypasses code issuance in signUp
+                null   // messageDispatcher — null bypasses dispatch
         );
         handler = new CognitoJsonHandler(service, mapper);
     }

@@ -3,6 +3,10 @@ package io.github.hectorvent.floci.services.cognito;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.cognito.verification.CognitoMessageDispatcher;
+import io.github.hectorvent.floci.services.cognito.verification.VerificationCode;
+import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeException;
+import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeService;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -54,12 +58,17 @@ public class CognitoService {
     private final String baseUrl;
     private final RegionResolver regionResolver;
     private final LambdaService lambdaService;
+    private final VerificationCodeService verificationCodes;
+    private final CognitoMessageDispatcher messageDispatcher;
 
     // Keyed by session token; contains SRP ephemeral state (bPrivate, B, A, secretBlock)
     private final CognitoAuthFlowHandler authFlowHandler;
 
     @Inject
-    public CognitoService(StorageFactory storageFactory, EmulatorConfig emulatorConfig, RegionResolver regionResolver, LambdaService lambdaService) {
+    public CognitoService(StorageFactory storageFactory, EmulatorConfig emulatorConfig,
+                          RegionResolver regionResolver, LambdaService lambdaService,
+                          io.github.hectorvent.floci.services.ses.SesService sesService,
+                          io.github.hectorvent.floci.services.sns.SnsService snsService) {
         this.poolStore = storageFactory.create("cognito", "cognito-pools.json",
                 new TypeReference<Map<String, UserPool>>() {});
         this.clientStore = storageFactory.create("cognito", "cognito-clients.json",
@@ -73,6 +82,8 @@ public class CognitoService {
         this.baseUrl = trimTrailingSlash(emulatorConfig.baseUrl());
         this.regionResolver = regionResolver;
         this.lambdaService = lambdaService;
+        this.verificationCodes = new VerificationCodeService(storageFactory, java.time.Clock.systemUTC());
+        this.messageDispatcher = new CognitoMessageDispatcher(sesService, snsService);
         this.authFlowHandler = new CognitoAuthFlowHandler(this, lambdaService, regionResolver);
     }
 
@@ -83,7 +94,9 @@ public class CognitoService {
                    StorageBackend<String, CognitoGroup> groupStore,
                    String baseUrl,
                    RegionResolver regionResolver,
-                   LambdaService lambdaService) {
+                   LambdaService lambdaService,
+                   VerificationCodeService verificationCodes,
+                   CognitoMessageDispatcher messageDispatcher) {
         this.poolStore = poolStore;
         this.clientStore = clientStore;
         this.resourceServerStore = resourceServerStore;
@@ -92,6 +105,8 @@ public class CognitoService {
         this.baseUrl = baseUrl;
         this.regionResolver = regionResolver;
         this.lambdaService = lambdaService;
+        this.verificationCodes = verificationCodes;
+        this.messageDispatcher = messageDispatcher;
         this.authFlowHandler = new CognitoAuthFlowHandler(this, lambdaService, regionResolver);
     }
 
@@ -797,21 +812,73 @@ public class CognitoService {
         // See: docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-sign-up.html
         if (preSignUp.autoConfirmUser()) {
             authFlowHandler.firePostConfirmation(pool, client, user, Map.of(), "PostConfirmation_ConfirmSignUp");
+            return user; // no code issued — user is already confirmed
+        }
+
+        // Real signup: issue a verification code and dispatch via SES/SNS.
+        // The plaintext code is never persisted; the dispatcher renders the
+        // VerificationMessageTemplate and hands the body to SES/SNS, where
+        // it lives in their inspection store for local clients to retrieve.
+        if (verificationCodes != null && messageDispatcher != null) {
+            try {
+                String code = verificationCodes.issue(userPoolId, username,
+                        VerificationCode.Purpose.SIGNUP_CONFIRMATION,
+                        java.time.Duration.ofHours(24));
+                messageDispatcher.dispatch(pool, user,
+                        VerificationCode.Purpose.SIGNUP_CONFIRMATION, code, java.util.List.of());
+            } catch (VerificationCodeException e) {
+                throw mapVerificationException(e);
+            }
         }
         return user;
     }
 
-    public void confirmSignUp(String clientId, String username) {
+    /**
+     * Confirm a signup with a verification code. The code must match the most
+     * recent code issued for (poolId, username, SIGNUP_CONFIRMATION).
+     *
+     * <p>If the user is already CONFIRMED, throws {@code NotAuthorizedException}
+     * (AWS-fiel — Cognito rejects re-confirmation).
+     */
+    public void confirmSignUp(String clientId, String username, String confirmationCode) {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found", 404));
         CognitoUser user = adminGetUser(client.getUserPoolId(), username);
+
+        if ("CONFIRMED".equals(user.getUserStatus())) {
+            throw new AwsException("NotAuthorizedException",
+                    "User cannot be confirmed. Current status is CONFIRMED", 400);
+        }
+
+        if (verificationCodes != null) {
+            try {
+                verificationCodes.consume(client.getUserPoolId(), username,
+                        VerificationCode.Purpose.SIGNUP_CONFIRMATION, confirmationCode);
+            } catch (VerificationCodeException e) {
+                throw mapVerificationException(e);
+            }
+        }
+
         user.setUserStatus("CONFIRMED");
+        user.getAttributes().put("email_verified", "true");
         user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
         userStore.put(userKey(client.getUserPoolId(), user.getUsername()), user);
 
         UserPool pool = poolStore.get(client.getUserPoolId())
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool not found", 404));
         authFlowHandler.firePostConfirmation(pool, client, user, Map.of(), "PostConfirmation_ConfirmSignUp");
+    }
+
+    /** Translate a VerificationCodeException into the corresponding AWS Cognito exception. */
+    private AwsException mapVerificationException(VerificationCodeException e) {
+        return switch (e.getKind()) {
+            case MISMATCH, NOT_FOUND -> new AwsException("CodeMismatchException",
+                    "Invalid verification code provided, please try again.", 400);
+            case EXPIRED -> new AwsException("ExpiredCodeException",
+                    "Invalid code provided, please request a code again.", 400);
+            case RATE_LIMIT -> new AwsException("LimitExceededException",
+                    "Attempt limit exceeded, please try after some time.", 400);
+        };
     }
 
     // ──────────────────────────── Auth ────────────────────────────

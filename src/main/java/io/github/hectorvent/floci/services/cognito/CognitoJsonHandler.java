@@ -453,7 +453,8 @@ public class CognitoJsonHandler {
     private Response handleConfirmSignUp(JsonNode request) {
         service.confirmSignUp(
                 request.path("ClientId").asText(),
-                request.path("Username").asText()
+                request.path("Username").asText(),
+                request.path("ConfirmationCode").asText()
         );
         return Response.ok(objectMapper.createObjectNode()).build();
     }
