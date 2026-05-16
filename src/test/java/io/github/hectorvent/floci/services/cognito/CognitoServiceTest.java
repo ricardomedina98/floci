@@ -38,7 +38,9 @@ class CognitoServiceTest {
                 groupStore,
                 "http://localhost:4566",
                 regionResolver,
-                null
+                null,
+                null,  // verificationCodes — not exercised in this test
+                null   // messageDispatcher — not exercised in this test
         );
     }
 
