@@ -52,7 +52,10 @@ class CognitoLambdaTriggersTest {
         service = new CognitoService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(),
-                "http://localhost:4566", regionResolver, lambdaService);
+                "http://localhost:4566", regionResolver, lambdaService,
+                null,  // verificationCodes — null bypasses code logic; tests use confirmSignUp("any")
+                null   // messageDispatcher — null bypasses SES/SNS dispatch
+        );
     }
 
     private UserPool createPoolWithLambdaConfig(Map<String, Object> lambdaConfig) {
@@ -183,7 +186,7 @@ class CognitoLambdaTriggersTest {
                 any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(ok(Map.of()));
 
-        service.confirmSignUp(client.getClientId(), "alice");
+        service.confirmSignUp(client.getClientId(), "alice", "000000");
 
         verify(lambdaService, atLeastOnce())
                 .invoke(anyString(), eq("arn:aws:lambda:::post-confirm"),
@@ -203,7 +206,7 @@ class CognitoLambdaTriggersTest {
                 .thenReturn(lambdaError("Unhandled"));
 
         // confirmSignUp must succeed even if the trigger errors (Cognito semantics)
-        service.confirmSignUp(client.getClientId(), "alice");
+        service.confirmSignUp(client.getClientId(), "alice", "000000");
         // Test passes if no exception was thrown.
     }
 
@@ -214,7 +217,7 @@ class CognitoLambdaTriggersTest {
 
         service.signUp(client.getClientId(), "alice", "Perm1234!",
                 Map.of("email", "alice@example.com"));
-        service.confirmSignUp(client.getClientId(), "alice");
+        service.confirmSignUp(client.getClientId(), "alice", "000000");
 
         verify(lambdaService, never())
                 .invoke(anyString(), anyString(), any(byte[].class), any());
